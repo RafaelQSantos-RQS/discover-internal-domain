@@ -388,28 +388,25 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				completed, speed, active := prog.snapshot()
-				if tuiRunner != nil {
+				completed, _, _ := prog.snapshot()
+				if tuiRunner != nil && tuiRunner.IsActive() {
+					_, speed, active := prog.snapshot()
 					tuiRunner.SendProgress(completed, active, speed)
 				} else if !noTUI {
-					// CLI mode with progress
-					clearLine := "\r\033[2K"
-					var totalStr string
+					// CLI mode: simple counter
 					if maxCombs > 0 {
-						pct := float64(completed) / float64(maxCombs) * 100
-						totalStr = fmt.Sprintf("/%d (%.1f%%)", maxCombs, pct)
+						fmt.Fprintf(os.Stderr, "\r[%d/%d]", completed, maxCombs)
+					} else {
+						fmt.Fprintf(os.Stderr, "\r[%d]", completed)
 					}
-					fmt.Fprintf(os.Stderr, "%s[%d%s] Speed: %.1f/s | Active: %d | Elapsed: %s",
-						clearLine, completed, totalStr, speed, active, prog.elapsed().Round(time.Second))
 				}
 			case <-ctx.Done():
-				if tuiRunner != nil {
+				if tuiRunner != nil && tuiRunner.IsActive() {
 					tuiRunner.Stop()
 				}
 				completed, _, _ := prog.snapshot()
-				if !noTUI {
-					fmt.Fprintf(os.Stderr, "\n[%d] Done. Total: %d | Elapsed: %s\n",
-						completed, completed, prog.elapsed().Round(time.Second))
+				if !noTUI && (tuiRunner == nil || !tuiRunner.IsActive()) {
+					fmt.Fprintf(os.Stderr, "\n[%d/%d] Done\n", completed, maxCombs)
 				}
 				return
 			}
@@ -432,9 +429,14 @@ func main() {
 
 	if tuiRunner != nil {
 		tuiRunner.Stop()
+		// Wait for TUI to fully close
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	log.Println("Done")
+	// Only print Done in non-TUI mode
+	if !noTUI && (tuiRunner == nil || !tuiRunner.IsActive()) {
+		fmt.Fprintf(os.Stderr, "\nDNS enumeration complete.\n")
+	}
 }
 
 // generator now uses strings.Builder for O(n) performance with atomic counter
@@ -569,7 +571,7 @@ func lookup(ctx context.Context, resolver *net.Resolver, sub string, wildcardIPs
 			return
 		}
 		// Send to TUI or print to stdout
-		if tui != nil {
+		if tui != nil && tui.IsActive() {
 			tui.SendResult(fqdn, ips)
 		} else {
 			printResults(fqdn, ips)

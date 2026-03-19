@@ -27,9 +27,6 @@ var (
 	progressBarFilled = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#7D56F4"))
 
-	resultStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#04B575"))
-
 	footerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888"))
 )
@@ -54,6 +51,7 @@ type progressMsg struct {
 	completed  int64
 	activeJobs int64
 	speed      float64
+	total      int64
 }
 
 type doneMsg struct {
@@ -126,6 +124,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.completed = msg.completed
 		m.activeJobs = msg.activeJobs
 		m.speed = msg.speed
+		m.total = msg.total
 		m.elapsed = time.Since(m.startTime)
 
 	case doneMsg:
@@ -153,7 +152,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m tuiModel) View() string {
+func (m *tuiModel) View() string {
 	// Progress bar
 	progressStr := m.renderProgressBar()
 
@@ -185,7 +184,7 @@ func (m tuiModel) View() string {
 	return sb.String()
 }
 
-func (m tuiModel) renderProgressBar() string {
+func (m *tuiModel) renderProgressBar() string {
 	var sb strings.Builder
 	sb.WriteString(" Progress: ")
 
@@ -215,12 +214,12 @@ func (m tuiModel) renderProgressBar() string {
 	return sb.String()
 }
 
-func (m tuiModel) renderStats() string {
+func (m *tuiModel) renderStats() string {
 	return fmt.Sprintf(" Speed: %.1f req/s | Active: %d | Workers: %d | Elapsed: %s",
 		m.speed, m.activeJobs, workers, m.elapsed.Round(time.Second))
 }
 
-// TUI Runner - starts the TUI and returns channels for communication
+// TUI Runner
 type TUIRunner struct {
 	resultCh   chan resultMsg
 	progressCh chan progressMsg
@@ -238,22 +237,21 @@ func newTUIRunner() *TUIRunner {
 	}
 }
 
-// Start attempts to start the TUI. Returns true if successful, false otherwise.
 func (t *TUIRunner) Start() bool {
 	go func() {
-		initialModel := newTUIModel(80, 24)
+		initialModel := newTUIModel(100, 30)
 		p := tea.NewProgram(initialModel, tea.WithAltScreen())
 		t.program = p
 		t.active = true
 		go t.messageLoop()
 		if _, err := p.Run(); err != nil {
-			// TUI couldn't start (no TTY), fall back to CLI
+			// TUI closed
 			t.active = false
 		}
 	}()
 
 	// Give it a moment to start
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	return t.active
 }
 
@@ -269,21 +267,28 @@ func (t *TUIRunner) messageLoop() {
 				t.program.Send(p)
 			}
 		case <-t.doneCh:
+			if t.program != nil && t.active {
+				t.program.Send(doneMsg{
+					totalDiscovered: 0,
+					elapsed:         time.Since(time.Now()),
+				})
+				t.program.Quit()
+			}
 			return
 		}
 	}
 }
 
 func (t *TUIRunner) Stop() {
-	t.doneCh <- struct{}{}
+	if t.active {
+		t.doneCh <- struct{}{}
+	}
 }
 
-// IsActive returns true if the TUI is running
 func (t *TUIRunner) IsActive() bool {
 	return t.active
 }
 
-// SendResult sends a DNS result to the TUI
 func (t *TUIRunner) SendResult(fqdn string, ips []string) {
 	if !t.active {
 		return
@@ -295,19 +300,13 @@ func (t *TUIRunner) SendResult(fqdn string, ips []string) {
 	}
 }
 
-// SendProgress sends progress update to the TUI
 func (t *TUIRunner) SendProgress(completed, activeJobs int64, speed float64) {
 	if !t.active {
 		return
 	}
 	select {
-	case t.progressCh <- progressMsg{completed: completed, activeJobs: activeJobs, speed: speed}:
+	case t.progressCh <- progressMsg{completed: completed, activeJobs: activeJobs, speed: speed, total: maxCombs}:
 	default:
 		// Channel full, skip
 	}
-}
-
-// StopTUI signals the TUI to stop
-func (t *TUIRunner) StopTUI() {
-	close(t.doneCh)
 }

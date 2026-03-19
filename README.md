@@ -59,17 +59,35 @@ outro.example.com -> 10.0.0.5,10.0.0.6
 
 ## Features
 
-- **Barra de progresso em tempo real**: Exibe completed/total, velocidade (req/s), workers ativos e tempo decorrido
+- **TUI Interativa**: Interface visual com barra de progresso, lista de descobertas em tempo real, e estatísticas
+- **CLI Mode**: Modo texto para CI/scripting (use `--no-tui`)
 - **Checkpoint atômico**: Salva progresso com escrita segura (temp + rename + sync) para retomar após interrupções
 - **Cache de negativas com limite**: Evita consultas NXDOMAIN redundantes com LRU (max 100k entradas)
 - **Segurança de memória**: maxlen limitado a 63 (label DNS), strings.Builder com grow validado
 - **Thread-safe**: Contador atômico para tracking de progresso
-- **Graceful shutdown**: SIGINT/SIGTERM para encerramento limpo com progresso final
+- **Graceful shutdown**: SIGINT/SIGTERM para encerramento limpo
 
-### Exemplo de saída com progresso
+### Exemplo TUI
 
 ```
-[100/100 (100.0%)] Speed: 25.0/s | Active: 4 | Elapsed: 4s
+┌─────────────────────────────────────────────────────────┐
+│  🔍 dnsbrute - Enumerating example.com                   │
+├─────────────────────────────────────────────────────────┤
+│  Progress: ████████████░░░░░░░░ 45% (450/1000)          │
+│  Speed: 25 req/s | Workers: 50 | Elapsed: 18s            │
+├─────────────────────────────────────────────────────────┤
+│  ✓ www.example.com → 192.168.1.10                       │
+│  ✓ api.example.com → 10.0.0.5, 10.0.0.6                │
+│  ✓ mail.example.com → 172.16.0.1                       │
+├─────────────────────────────────────────────────────────┤
+│  Press Ctrl+C to stop                                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Modo CLI (para CI/scripting)
+
+```bash
+./dnsbrute -d example.com -m 4 -w 50 --no-tui
 ```
 
 ## Construção Cruzada

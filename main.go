@@ -47,6 +47,7 @@ var (
 	bufferSize int
 	checkpoint string
 	cacheTTL   time.Duration
+	noTUI      bool
 )
 
 func init() {
@@ -63,6 +64,7 @@ func init() {
 	pflag.IntVarP(&bufferSize, "buffer", "b", 100, "Channel buffer size for job dispatching")
 	pflag.StringVarP(&checkpoint, "checkpoint", "k", "", "Checkpoint file for resumable enumeration")
 	pflag.DurationVarP(&cacheTTL, "cache-ttl", "l", 5*time.Minute, "Negative DNS cache TTL (0=disabled)")
+	pflag.BoolVarP(&noTUI, "no-tui", "", false, "Disable TUI mode (for CI/scripting)")
 
 	pflag.Parse()
 
@@ -265,6 +267,7 @@ func main() {
 		cancel()
 	}()
 
+	// Log config
 	log.Println("========================================")
 	log.Println("  DNS Enumeration Configuration")
 	log.Println("========================================")
@@ -285,6 +288,9 @@ func main() {
 	}
 	if cacheTTL > 0 {
 		log.Printf("  Cache TTL:        %v\n", cacheTTL)
+	}
+	if noTUI {
+		log.Printf("  TUI Mode:         disabled\n")
 	}
 	log.Println("========================================")
 
@@ -366,30 +372,45 @@ func main() {
 		}
 	}
 
-	// Progress bar goroutine - outputs to stderr only
+	// Initialize TUI or CLI mode
+	var tuiRunner *TUIRunner
+	if !noTUI {
+		tuiRunner = newTUIRunner()
+		tuiRunner.Start()
+		time.Sleep(100 * time.Millisecond) // Give TUI time to start
+	}
+
+	// Progress update goroutine
 	go func() {
 		ticker := time.NewTicker(progressTick)
 		defer ticker.Stop()
-
-		// ANSI escape code to clear line and move cursor back
-		clearLine := "\r\033[2K"
 
 		for {
 			select {
 			case <-ticker.C:
 				completed, speed, active := prog.snapshot()
-				var totalStr string
-				if maxCombs > 0 {
-					pct := float64(completed) / float64(maxCombs) * 100
-					totalStr = fmt.Sprintf("/%d (%.1f%%)", maxCombs, pct)
+				if tuiRunner != nil {
+					tuiRunner.SendProgress(completed, active, speed)
+				} else if !noTUI {
+					// CLI mode with progress
+					clearLine := "\r\033[2K"
+					var totalStr string
+					if maxCombs > 0 {
+						pct := float64(completed) / float64(maxCombs) * 100
+						totalStr = fmt.Sprintf("/%d (%.1f%%)", maxCombs, pct)
+					}
+					fmt.Fprintf(os.Stderr, "%s[%d%s] Speed: %.1f/s | Active: %d | Elapsed: %s",
+						clearLine, completed, totalStr, speed, active, prog.elapsed().Round(time.Second))
 				}
-				elapsed := prog.elapsed()
-				fmt.Fprintf(os.Stderr, "%s[%d%s] Speed: %.1f/s | Active: %d | Elapsed: %s",
-					clearLine, completed, totalStr, speed, active, elapsed.Round(time.Second))
 			case <-ctx.Done():
+				if tuiRunner != nil {
+					tuiRunner.Stop()
+				}
 				completed, _, _ := prog.snapshot()
-				fmt.Fprintf(os.Stderr, "\n[%d] Done. Total: %d | Elapsed: %s\n",
-					completed, completed, prog.elapsed().Round(time.Second))
+				if !noTUI {
+					fmt.Fprintf(os.Stderr, "\n[%d] Done. Total: %d | Elapsed: %s\n",
+						completed, completed, prog.elapsed().Round(time.Second))
+				}
 				return
 			}
 		}
@@ -401,13 +422,17 @@ func main() {
 	wg.Add(workers)
 	activeWorkers.Store(int64(workers))
 	for i := 0; i < workers; i++ {
-		go worker(ctx, jobs, &wg, wildcardIPs, negCache, prog)
+		go worker(ctx, jobs, &wg, wildcardIPs, negCache, prog, tuiRunner)
 	}
 
 	generator(ctx, jobs, maxLen, maxCombs, cpData, saveCheckpoint, prog)
 
 	close(jobs)
 	wg.Wait()
+
+	if tuiRunner != nil {
+		tuiRunner.Stop()
+	}
 
 	log.Println("Done")
 }
@@ -492,7 +517,7 @@ func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int
 	}
 }
 
-func worker(ctx context.Context, jobs <-chan string, wg *sync.WaitGroup, wildcardIPs map[string]struct{}, negCache *negCache, prog *progress) {
+func worker(ctx context.Context, jobs <-chan string, wg *sync.WaitGroup, wildcardIPs map[string]struct{}, negCache *negCache, prog *progress, tui *TUIRunner) {
 	defer func() {
 		activeWorkers.Add(-1)
 		wg.Done()
@@ -513,13 +538,13 @@ func worker(ctx context.Context, jobs <-chan string, wg *sync.WaitGroup, wildcar
 				return
 			}
 			prog.jobStarted()
-			lookup(ctx, resolver, sub, wildcardIPs, negCache)
+			lookup(ctx, resolver, sub, wildcardIPs, negCache, tui)
 			prog.jobFinished()
 		}
 	}
 }
 
-func lookup(ctx context.Context, resolver *net.Resolver, sub string, wildcardIPs map[string]struct{}, negCache *negCache) {
+func lookup(ctx context.Context, resolver *net.Resolver, sub string, wildcardIPs map[string]struct{}, negCache *negCache, tui *TUIRunner) {
 	fqdn := sub + "." + domain
 
 	// Check negative cache first
@@ -543,7 +568,12 @@ func lookup(ctx context.Context, resolver *net.Resolver, sub string, wildcardIPs
 		if wildcardIPs != nil && isWildcardResponse(ips, wildcardIPs) {
 			return
 		}
-		printResults(fqdn, ips)
+		// Send to TUI or print to stdout
+		if tui != nil {
+			tui.SendResult(fqdn, ips)
+		} else {
+			printResults(fqdn, ips)
+		}
 	}
 }
 

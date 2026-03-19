@@ -40,22 +40,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-${{ matrix.go-version }}-
 
+      - name: Format check
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "Files not formatted. Run: gofmt -s -w ."
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+          echo "Format check passed"
+
       - name: Build
-        shell: bash
         run: go build -v ./...
 
       - name: Test with race detection
-        shell: bash
         run: go test -race -count=1 -shuffle=on ./...
-
-      - name: Format check
-        shell: bash
-        run: |
-          if [ -n "$(gofmt -l .)" ]; then
-            echo "Files not formatted. Run 'gofmt -s -w .'"
-            gofmt -l .
-            exit 1
-          fi
 
       - name: Vet
         run: go vet ./...

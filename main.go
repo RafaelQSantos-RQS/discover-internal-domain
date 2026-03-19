@@ -190,6 +190,7 @@ type progress struct {
 	lastCount  int64
 	lastTime   time.Time
 	startTime  time.Time
+	muPrint    sync.Mutex
 }
 
 func newProgress() *progress {
@@ -241,6 +242,16 @@ func (p *progress) elapsed() time.Duration {
 
 // Active workers counter
 var activeWorkers atomic.Int64
+
+// Global print mutex for synchronized output
+var printMu sync.Mutex
+
+// printResults outputs found subdomains to stdout
+func printResults(fqdn string, ips []string) {
+	printMu.Lock()
+	defer printMu.Unlock()
+	fmt.Printf("%s -> %s\n", fqdn, strings.Join(ips, ","))
+}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -355,10 +366,13 @@ func main() {
 		}
 	}
 
-	// Progress bar goroutine
+	// Progress bar goroutine - outputs to stderr only
 	go func() {
 		ticker := time.NewTicker(progressTick)
 		defer ticker.Stop()
+
+		// ANSI escape code to clear line and move cursor back
+		clearLine := "\r\033[2K"
 
 		for {
 			select {
@@ -370,12 +384,11 @@ func main() {
 					totalStr = fmt.Sprintf("/%d (%.1f%%)", maxCombs, pct)
 				}
 				elapsed := prog.elapsed()
-				fmt.Printf("\r[%d%s] Speed: %.1f/s | Active: %d | Elapsed: %s",
-					completed, totalStr, speed, active, elapsed.Round(time.Second))
+				fmt.Fprintf(os.Stderr, "%s[%d%s] Speed: %.1f/s | Active: %d | Elapsed: %s",
+					clearLine, completed, totalStr, speed, active, elapsed.Round(time.Second))
 			case <-ctx.Done():
-				// Final progress update before exit
 				completed, _, _ := prog.snapshot()
-				fmt.Printf("\r[%d] Done. Total: %d | Elapsed: %s\n",
+				fmt.Fprintf(os.Stderr, "\n[%d] Done. Total: %d | Elapsed: %s\n",
 					completed, completed, prog.elapsed().Round(time.Second))
 				return
 			}
@@ -530,7 +543,7 @@ func lookup(ctx context.Context, resolver *net.Resolver, sub string, wildcardIPs
 		if wildcardIPs != nil && isWildcardResponse(ips, wildcardIPs) {
 			return
 		}
-		fmt.Printf("%s -> %s\n", fqdn, strings.Join(ips, ","))
+		printResults(fqdn, ips)
 	}
 }
 

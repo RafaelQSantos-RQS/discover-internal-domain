@@ -1,0 +1,22 @@
+# Force LF line endings on all platforms for consistency
+* text=auto eol=lf
+
+# Go files
+*.go text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Git workflow files
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Text files
+*.md text eol=lf
+*.txt text eol=lf
+
+# Ensure Go binaries are not treated as text
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary

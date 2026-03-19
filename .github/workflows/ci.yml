@@ -41,6 +41,7 @@ jobs:
             ${{ runner.os }}-go-${{ matrix.go-version }}-
 
       - name: Format check
+        shell: bash
         run: |
           UNFORMATTED=$(gofmt -l .)
           if [ -n "$UNFORMATTED" ]; then

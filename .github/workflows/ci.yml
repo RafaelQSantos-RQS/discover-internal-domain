@@ -43,13 +43,10 @@ jobs:
       - name: Format check
         shell: bash
         run: |
-          UNFORMATTED=$(gofmt -l .)
-          if [ -n "$UNFORMATTED" ]; then
-            echo "Files not formatted. Run: gofmt -s -w ."
-            echo "$UNFORMATTED"
-            exit 1
-          fi
-          echo "Format check passed"
+          echo "Checking formatting..."
+          FILES=$(gofmt -l .)
+          echo "Unformatted files: $FILES"
+          test -z "$FILES"
 
       - name: Build
         run: go build -v ./...

@@ -1,73 +1,88 @@
-# discover-internal-domain
+# dnsbrute
 
-## Planejamento da Ferramenta de Descoberta de Ativos Internos via DNS (Go)
+Ferramenta de enumeração DNS para descoberta de ativos internos via brute-force de subdomínios.
 
-### 1. Visão geral
-- **Objetivo:** Gerar combinações de subdomínios (a‑z, 0‑9) até um comprimento máximo e consultar o DNS interno, exibindo apenas resultados válidos.
-- **Riscos principais:** DoS ao servidor DNS, falsos positivos por wildcard DNS e consumo excessivo de memória/CPU.
-- **Mitigações:** Worker‑pool para limitar concorrência, `context.Context` com timeout por consulta, detecção e filtragem de wildcard, geração **iterativa** de combinações para evitar alocação massiva.
+## Instalação
 
-### 2. Algoritmo de Permutação
-- Alfabeto: `abcdefghijklmnopqrstuvwxyz0123456789` (36 símbolos).
-- Geração **iterativa** usando um vetor de índices que age como contador em base‑36; mantém apenas `O(maxLen)` memória.
-- Uma goroutine de *generator* produz strings on‑the‑fly e as envia por um canal `jobs`.
+```bash
+# Compilar
+go build -o dnsbrute .
 
-### 3. Modelo de Concurrency – Worker Pool
-- Canal `jobs` (buffer pequeno) alimenta **N workers** (configurável via flag `-workers`).
-- Cada worker consome do canal, faz a consulta DNS e, se positivo, escreve a saída.
-- `sync.WaitGroup` garante encerramento somente após todos os workers completarem.
-
-### 4. Tratamento de DNS Wildcard
-1. **Detecção preliminar** – consulta um nome aleatório impossível; se houver resposta, há wildcard.
-2. **Filtragem** – comparar resposta de cada sub‑domínio com o conjunto obtido na detecção; aceitar apenas se diferente ou houver registros adicionais.
-3. **Delay opcional** entre requisições para reduzir carga.
-
-### 5. Controle de Timeout
-- Cada consulta recebe `context.WithTimeout(parent, timeout)`; timeout configurável via flag `-timeout` (ex.: `2s`).
-- Falhas por timeout são descartadas silenciosamente.
-
-### 6. Flags de Configuração
-```
--domain           string   Domínio base (ex.: example.com.br) (obrigatório)
--maxlen, -m      int      Comprimento máximo das combinações (default 5)
--workers, -w     int      Número de goroutines workers (default NumCPU)
--timeout, -t     duration Timeout por consulta DNS (default 2s)
--wildcard, -W    bool     Habilitar verificação de wildcard (default true)
--out, -o         string   Arquivo opcional para gravação dos resultados
--buffer, -b      int      Tamanho do buffer do canal de jobs (default 100)
--checkpoint, -k  string   Arquivo de checkpoint para retomada (default "")
--cache-ttl, -l   duration TTL do cache de respostas negativas (default 5m, 0=desabilitado)
+# Ou instalar via go install
+go install .
 ```
 
-### 7. Saída
-Formato de linha única:
+## Uso
+
+```bash
+# Enumeração básica
+./dnsbrute -d example.com -m 3 -w 20
+
+# Com checkpoint para retomar após interrupção
+./dnsbrute -d example.com -m 4 -k checkpoint.json
+
+# Com cache de respostas negativas
+./dnsbrute -d example.com -l 10m -c 100000
+
+# Aumentar buffer para melhor throughput
+./dnsbrute -d example.com -b 500 -w 50
 ```
-subX.example.com.br -> 10.0.1.23
-subY.example.com.br -> 10.0.2.45,10.0.2.46
+
+## Opções
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `-d, --domain` | Domínio base (obrigatório) | - |
+| `-m, --maxlen` | Comprimento máximo de subdomínios | 5 |
+| `-w, --workers` | Número de workers concorrentes | NumCPU |
+| `-t, --timeout` | Timeout por consulta DNS | 2s |
+| `-W, --wildcard` | Habilitar detecção de wildcard | true |
+| `-o, --out` | Arquivo de saída | stdout |
+| `-c, --max-combinations` | Limite de combinações | unlimited |
+| `-b, --buffer` | Tamanho do buffer de jobs | 100 |
+| `-k, --checkpoint` | Arquivo de checkpoint | - |
+| `-l, --cache-ttl` | TTL do cache negativo | 5m |
+
+## Como funciona
+
+1. Gera combinações iterativas de subdomínios (a-z, 0-9, `-`)
+2. Workers concurrentes consultam o DNS
+3. Wildcards são detectados e filtrados automaticamente
+4. Resultados válidos são exibidos
+
+## Saída
+
+```
+subdominio.example.com -> 192.168.1.10
+outro.example.com -> 10.0.0.5,10.0.0.6
 ```
 
-### 8. Robustez
-- `sync.WaitGroup` + fechamento do canal garantem término ordenado.
-- Tratamento de sinais (`SIGINT`) para cancelamento gracioso.
+## Features
 
-### 9. Otimizações implementadas
-- **Checkpoint**: gravação atômica (temp + rename) do estado em JSON para retomada após interrupções.
-- **Cache de respostas negativas**: cache LRU thread-safe com TTL configurável para evitar consultas NXDOMAIN repetidas.
-- **Otimização do generator**: `strings.Builder` com pré-alocação para O(n) ao invés de O(n²).
-- **Buffer configurável**: tamanho do canal de jobs ajustável via flag `-buffer`.
-- **Resolver customizado** (`net.Resolver{PreferGo:true}`) para ignorar cache do SO.
+- **Checkpoint/Resume**: Salva progresso automaticamente para retomar após interrupções
+- **Cache de negativas**: Evita consultas redundantes NXDOMAIN
+- **Generator otimizado**: Usa strings.Builder para O(n) ao invés de O(n²)
+- **Buffer configurável**: Ajuste para sua rede
+- **Graceful shutdown**: SIGINT/SIGTERM para encerramento limpo
 
-### 10. Resumo da Implementação
-1. Ler flags e validar parâmetros.
-2. (Opcional) Carregar checkpoint existente para retomada.
-3. Detectar wildcard (consulta aleatória) se `-W` habilitado.
-4. Iniciar cache de respostas negativas se `-l > 0`.
-5. Iniciar canal `jobs` com tamanho `-b`, WaitGroup e workers.
-6. Gerador iterativo com `strings.Builder` produz sub‑domínios e envia ao canal.
-7. Cada worker resolve via `net.Resolver` com timeout, filtra wildcard e imprime resultados.
-8. Salvar checkpoint periodicamente (a cada 1000 combinações) e ao completar.
-9. Encerrar aguardando WaitGroup, fechar arquivos.
+## Construção Cruzada
 
----
+```bash
+# Linux
+GOOS=linux GOARCH=amd64 go build -o dnsbrute-linux-amd64 .
 
-Com esse planejamento você pode seguir diretamente para a codificação em Go, garantindo segurança, eficiência e capacidade de retomada em caso de falhas.
+# macOS
+GOOS=darwin GOARCH=arm64 go build -o dnsbrute-darwin-arm64 .
+
+# Windows
+GOOS=windows GOARCH=amd64 go build -o dnsbrute.exe .
+```
+
+## Requisitos
+
+- Go 1.22+
+- Permissão para consultas DNS ao domínio alvo
+
+## Aviso
+
+Use apenas em domínios que você tem autorização para testar. Enumeração não autorizada pode ser ilegal.

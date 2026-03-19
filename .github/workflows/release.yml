@@ -29,11 +29,8 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Get version
-        id: vars
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
       - name: Build binary
+        id: build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -41,15 +38,15 @@ jobs:
         run: |
           EXT=""
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
-          NAME="dnsbrute-${GOOS}-${GOARCH}${EXT}"
-          go build -ldflags="-s -w" -o "$NAME" .
-          echo "NAME=$NAME" >> $GITHUB_OUTPUT
+          FILENAME="dnsbrute-${GOOS}-${GOARCH}${EXT}"
+          go build -ldflags="-s -w" -o "$FILENAME" .
+          echo "FILENAME=$FILENAME" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: dnsbrute-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ${{ env.NAME }}
+          path: ${{ steps.build.outputs.FILENAME }}
 
   release:
     name: Create Release

@@ -43,14 +43,13 @@ jobs:
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
           NAME="dnsbrute-${GOOS}-${GOARCH}${EXT}"
           go build -ldflags="-s -w" -o "$NAME" .
-          echo "Binary name: $NAME"
+          echo "NAME=$NAME" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: dnsbrute-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            dnsbrute-*
+          path: ${{ env.NAME }}
 
   release:
     name: Create Release
@@ -65,6 +64,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v5
         with:
+          pattern: 'dnsbrute-*'
           path: artifacts
           merge-multiple: true
 
@@ -81,7 +81,6 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
           generate_release_notes: true
-          files: |
-            dnsbrute-*
+          files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -40,7 +40,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-${{ matrix.go-version }}-
 
+      - name: Build
+        shell: bash
+        run: go build -v ./...
+
+      - name: Test with race detection
+        shell: bash
+        run: go test -race -count=1 -shuffle=on ./...
+
       - name: Format check
+        shell: bash
         run: |
           if [ -n "$(gofmt -l .)" ]; then
             echo "Files not formatted. Run 'gofmt -s -w .'"
@@ -50,12 +59,6 @@ jobs:
 
       - name: Vet
         run: go vet ./...
-
-      - name: Build
-        run: go build -v ./...
-
-      - name: Test with race detection
-        run: go test -race -count=1 -shuffle=on ./...
 
   lint:
     name: Lint

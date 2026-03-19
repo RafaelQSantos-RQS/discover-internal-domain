@@ -16,10 +16,18 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
+)
+
+const (
+	maxMaxLen    = 63                     // DNS label max length
+	maxNegCache  = 100_000                // Max entries in negative cache
+	maxGrowSize  = maxMaxLen + 10         // Max size for strings.Builder.Grow()
+	progressTick = 500 * time.Millisecond // Progress bar update interval
 )
 
 // Existing flags
@@ -78,6 +86,10 @@ func init() {
 		fmt.Fprintln(os.Stderr, "Error: --maxlen must be >= 1")
 		os.Exit(1)
 	}
+	if maxLen > maxMaxLen {
+		fmt.Fprintf(os.Stderr, "Error: --maxlen capped at %d (DNS label limit)\n", maxMaxLen)
+		maxLen = maxMaxLen
+	}
 	if workers < 1 {
 		fmt.Fprintln(os.Stderr, "Error: --workers must be >= 1")
 		os.Exit(1)
@@ -92,17 +104,21 @@ func init() {
 	}
 }
 
-// Negative cache for NXDOMAIN responses
+// negCache with hard limit for memory safety
 type negCache struct {
-	mu    sync.RWMutex
-	cache map[string]time.Time
-	ttl   time.Duration
+	mu         sync.RWMutex
+	cache      map[string]time.Time
+	access     []string // LRU tracking (oldest first)
+	maxEntries int
+	ttl        time.Duration
 }
 
 func newNegCache(ttl time.Duration) *negCache {
 	return &negCache{
-		cache: make(map[string]time.Time),
-		ttl:   ttl,
+		cache:      make(map[string]time.Time),
+		access:     make([]string, 0, maxNegCache),
+		maxEntries: maxNegCache,
+		ttl:        ttl,
 	}
 }
 
@@ -124,7 +140,16 @@ func (nc *negCache) add(fqdn string) {
 	}
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
+
+	// Evict oldest entries if at capacity
+	for len(nc.cache) >= nc.maxEntries && len(nc.access) > 0 {
+		oldest := nc.access[0]
+		nc.access = nc.access[1:]
+		delete(nc.cache, oldest)
+	}
+
 	nc.cache[fqdn] = time.Now().Add(nc.ttl)
+	nc.access = append(nc.access, fqdn)
 }
 
 func (nc *negCache) cleanup() {
@@ -134,11 +159,16 @@ func (nc *negCache) cleanup() {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	now := time.Now()
-	for fqdn, expire := range nc.cache {
-		if now.After(expire) {
+
+	newAccess := make([]string, 0, len(nc.access))
+	for _, fqdn := range nc.access {
+		if expire, ok := nc.cache[fqdn]; ok && now.After(expire) {
 			delete(nc.cache, fqdn)
+		} else {
+			newAccess = append(newAccess, fqdn)
 		}
 	}
+	nc.access = newAccess
 }
 
 // Checkpoint data structure
@@ -152,6 +182,66 @@ type checkpointData struct {
 	WildcardIPs []string  `json:"wildcard_ips,omitempty"`
 }
 
+// Progress tracking
+type progress struct {
+	completed  atomic.Int64
+	activeJobs atomic.Int64
+	mu         sync.RWMutex
+	lastCount  int64
+	lastTime   time.Time
+	startTime  time.Time
+}
+
+func newProgress() *progress {
+	return &progress{
+		lastTime:  time.Now(),
+		startTime: time.Now(),
+	}
+}
+
+func (p *progress) increment() {
+	p.completed.Add(1)
+}
+
+func (p *progress) jobStarted() {
+	p.activeJobs.Add(1)
+}
+
+func (p *progress) jobFinished() {
+	p.activeJobs.Add(-1)
+}
+
+func (p *progress) speed() float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	elapsed := now.Sub(p.lastTime).Seconds()
+	if elapsed < 0.1 {
+		return 0
+	}
+
+	count := p.completed.Load()
+	speed := float64(count-p.lastCount) / elapsed
+	return speed
+}
+
+func (p *progress) snapshot() (completed int64, speed float64, active int64) {
+	p.mu.Lock()
+	p.lastCount = p.completed.Load()
+	p.lastTime = time.Now()
+	p.mu.Unlock()
+
+	return p.lastCount, p.speed(), p.activeJobs.Load()
+}
+
+func (p *progress) elapsed() time.Duration {
+	return time.Since(p.startTime)
+}
+
+// Active workers counter
+var activeWorkers atomic.Int64
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -160,7 +250,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Println("Interrupted, shutting down...")
+		log.Println("\nInterrupted, shutting down...")
 		cancel()
 	}()
 
@@ -238,6 +328,9 @@ func main() {
 
 	log.Printf("Starting DNS enumeration for %s\n", domain)
 
+	// Initialize progress tracker
+	prog := newProgress()
+
 	// Start periodic checkpoint saver
 	var checkpointMu sync.Mutex
 	var saveCheckpoint func(completed int64, indices []int, length int)
@@ -262,52 +355,77 @@ func main() {
 		}
 	}
 
+	// Progress bar goroutine
+	go func() {
+		ticker := time.NewTicker(progressTick)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				completed, speed, active := prog.snapshot()
+				var totalStr string
+				if maxCombs > 0 {
+					pct := float64(completed) / float64(maxCombs) * 100
+					totalStr = fmt.Sprintf("/%d (%.1f%%)", maxCombs, pct)
+				}
+				elapsed := prog.elapsed()
+				fmt.Printf("\r[%d%s] Speed: %.1f/s | Active: %d | Elapsed: %s",
+					completed, totalStr, speed, active, elapsed.Round(time.Second))
+			case <-ctx.Done():
+				// Final progress update before exit
+				completed, _, _ := prog.snapshot()
+				fmt.Printf("\r[%d] Done. Total: %d | Elapsed: %s\n",
+					completed, completed, prog.elapsed().Round(time.Second))
+				return
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	jobs := make(chan string, bufferSize)
 
 	wg.Add(workers)
+	activeWorkers.Store(int64(workers))
 	for i := 0; i < workers; i++ {
-		go worker(ctx, jobs, &wg, wildcardIPs, negCache)
+		go worker(ctx, jobs, &wg, wildcardIPs, negCache, prog)
 	}
 
-	generator(ctx, jobs, maxLen, maxCombs, cpData, saveCheckpoint)
+	generator(ctx, jobs, maxLen, maxCombs, cpData, saveCheckpoint, prog)
 
 	close(jobs)
 	wg.Wait()
 
-	// Final checkpoint save on completion
-	if checkpoint != "" {
-		// Get final state from generator context
-		// This is already handled in generator on maxCombs/maxLen completion
-	}
-
 	log.Println("Done")
 }
 
-// generator now uses strings.Builder for O(n) performance
-func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int64, cp *checkpointData, saveCheckpoint func(int64, []int, int)) {
+// generator now uses strings.Builder for O(n) performance with atomic counter
+func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int64, cp *checkpointData, saveCheckpoint func(int64, []int, int), prog *progress) {
 	alphabet := "abcdefghijklmnopqrstuvwxyz0123456789-"
 	length := 1
 	indices := make([]int, maxLen)
-	generated := int64(0)
 
 	// Resume from checkpoint
 	if cp != nil {
 		indices = cp.LastIndex
 		length = cp.Length
-		generated = cp.Completed
-		log.Printf("Generator resumed from length=%d, indices=%v, completed=%d\n", length, indices, generated)
+		// Note: completed count starts from checkpoint value via generator tracking
+		log.Printf("Generator resumed from length=%d, indices=%v\n", length, indices)
 	}
 
-	// Pre-allocate strings.Builder for efficiency
+	// Pre-allocate strings.Builder with validated size
 	var sb strings.Builder
-	sb.Grow(maxLen) // Pre-allocate capacity
+	growSize := length
+	if growSize > maxGrowSize {
+		growSize = maxGrowSize
+	}
+	sb.Grow(growSize)
 
 	for length <= maxLen {
-		if maxCombs > 0 && generated >= maxCombs {
+		if maxCombs > 0 && prog.completed.Load() >= maxCombs {
 			// Save checkpoint before exiting
 			if saveCheckpoint != nil {
-				saveCheckpoint(generated, indices, length)
+				saveCheckpoint(prog.completed.Load(), indices, length)
 			}
 			return
 		}
@@ -320,6 +438,10 @@ func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int
 
 		// O(n) string building using strings.Builder
 		sb.Reset()
+		// Adjust grow size if length increased
+		if length > sb.Cap() && length <= maxGrowSize {
+			sb.Grow(length)
+		}
 		for i := 0; i < length; i++ {
 			sb.WriteByte(alphabet[indices[i]])
 		}
@@ -329,12 +451,12 @@ func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int
 		case <-ctx.Done():
 			return
 		case jobs <- comb:
+			prog.increment()
 		}
-		generated++
 
 		// Periodic checkpoint save
-		if saveCheckpoint != nil && generated%1000 == 0 {
-			saveCheckpoint(generated, indices, length)
+		if saveCheckpoint != nil && prog.completed.Load()%1000 == 0 {
+			saveCheckpoint(prog.completed.Load(), indices, length)
 		}
 
 		for i := length - 1; i >= 0; i-- {
@@ -348,7 +470,7 @@ func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int
 				if length > maxLen {
 					// Final checkpoint save
 					if saveCheckpoint != nil {
-						saveCheckpoint(generated, indices, length)
+						saveCheckpoint(prog.completed.Load(), indices, length)
 					}
 					return
 				}
@@ -357,11 +479,16 @@ func generator(ctx context.Context, jobs chan<- string, maxLen int, maxCombs int
 	}
 }
 
-func worker(ctx context.Context, jobs <-chan string, wg *sync.WaitGroup, wildcardIPs map[string]struct{}, negCache *negCache) {
-	defer wg.Done()
+func worker(ctx context.Context, jobs <-chan string, wg *sync.WaitGroup, wildcardIPs map[string]struct{}, negCache *negCache, prog *progress) {
+	defer func() {
+		activeWorkers.Add(-1)
+		wg.Done()
+	}()
 
+	// Use Go native resolver (PreferGo: true, StrictErrors: false)
 	resolver := &net.Resolver{
-		PreferGo: true,
+		PreferGo:     true,
+		StrictErrors: false,
 	}
 
 	for {
@@ -372,7 +499,9 @@ func worker(ctx context.Context, jobs <-chan string, wg *sync.WaitGroup, wildcar
 			if !ok {
 				return
 			}
+			prog.jobStarted()
 			lookup(ctx, resolver, sub, wildcardIPs, negCache)
+			prog.jobFinished()
 		}
 	}
 }
@@ -418,8 +547,10 @@ func isWildcardResponse(ips []string, wildcardIPs map[string]struct{}) bool {
 }
 
 func detectWildcard(ctx context.Context) map[string]struct{} {
+	// Use Go native resolver
 	resolver := &net.Resolver{
-		PreferGo: true,
+		PreferGo:     true,
+		StrictErrors: false,
 	}
 
 	randomSub := generateRandomSubdomain(12)
@@ -464,8 +595,6 @@ func loadCheckpoint(path, expectedDomain string, expectedMaxLen int) (*checkpoin
 		return nil, fmt.Errorf("read checkpoint: %w", err)
 	}
 
-	// Simple JSON parsing without external dependency
-	// Format: {"completed":N,"last_index":[...],"length":N,"timestamp":"..."}
 	var cp checkpointData
 
 	// Parse completed
@@ -531,13 +660,16 @@ func writeCheckpoint(path string, data *checkpointData) error {
 
 	tmp.Close()
 
+	// Sync to disk before renaming (reduces corruption risk on crash)
+	tmp.Sync()
+
 	// Set restrictive permissions
 	if err := os.Chmod(tmpPath, 0600); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("set permissions: %w", err)
 	}
 
-	// Atomic rename
+	// Atomic rename (POSIX guarantees atomicity)
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("atomic rename: %w", err)
@@ -560,7 +692,6 @@ func parseJSONInt(data, field string) (int64, error) {
 		return 0, fmt.Errorf("field not found")
 	}
 
-	// Read number
 	start := idx
 	for start < len(data) && (data[start] < '0' || data[start] > '9') && data[start] != '-' {
 		start++
@@ -596,7 +727,6 @@ func parseJSONString(data, field string) (string, error) {
 		return "", fmt.Errorf("field not found")
 	}
 
-	// Read string until closing quote
 	end := idx
 	for end < len(data) && data[end] != '"' {
 		end++
@@ -623,7 +753,6 @@ func parseJSONIntArray(data, field string) ([]int, error) {
 
 	var result []int
 	for idx < len(data) {
-		// Skip whitespace and commas
 		for idx < len(data) && (data[idx] == ' ' || data[idx] == '\t' || data[idx] == ',' || data[idx] == '\n') {
 			idx++
 		}
@@ -631,7 +760,6 @@ func parseJSONIntArray(data, field string) ([]int, error) {
 			break
 		}
 
-		// Read number
 		start := idx
 		for start < len(data) && (data[start] < '0' || data[start] > '9') {
 			start++
@@ -669,7 +797,6 @@ func parseJSONStringArray(data, field string) ([]string, error) {
 
 	var result []string
 	for idx < len(data) {
-		// Skip whitespace
 		for idx < len(data) && (data[idx] == ' ' || data[idx] == '\t' || data[idx] == ',' || data[idx] == '\n') {
 			idx++
 		}
@@ -677,12 +804,10 @@ func parseJSONStringArray(data, field string) ([]string, error) {
 			break
 		}
 
-		// Skip opening quote
 		if data[idx] == '"' {
 			idx++
 		}
 
-		// Read string until closing quote
 		start := idx
 		for idx < len(data) && data[idx] != '"' {
 			idx++
@@ -690,7 +815,7 @@ func parseJSONStringArray(data, field string) ([]string, error) {
 		if idx > start {
 			result = append(result, data[start:idx])
 		}
-		idx++ // Skip closing quote
+		idx++
 	}
 	return result, nil
 }

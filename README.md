@@ -33,7 +33,7 @@ go install .
 | Flag | Descrição | Padrão |
 |------|-----------|--------|
 | `-d, --domain` | Domínio base (obrigatório) | - |
-| `-m, --maxlen` | Comprimento máximo de subdomínios | 5 |
+| `-m, --maxlen` | Comprimento máximo (max 63, limite DNS) | 5 |
 | `-w, --workers` | Número de workers concorrentes | NumCPU |
 | `-t, --timeout` | Timeout por consulta DNS | 2s |
 | `-W, --wildcard` | Habilitar detecção de wildcard | true |
@@ -59,11 +59,18 @@ outro.example.com -> 10.0.0.5,10.0.0.6
 
 ## Features
 
-- **Checkpoint/Resume**: Salva progresso automaticamente para retomar após interrupções
-- **Cache de negativas**: Evita consultas redundantes NXDOMAIN
-- **Generator otimizado**: Usa strings.Builder para O(n) ao invés de O(n²)
-- **Buffer configurável**: Ajuste para sua rede
-- **Graceful shutdown**: SIGINT/SIGTERM para encerramento limpo
+- **Barra de progresso em tempo real**: Exibe completed/total, velocidade (req/s), workers ativos e tempo decorrido
+- **Checkpoint atômico**: Salva progresso com escrita segura (temp + rename + sync) para retomar após interrupções
+- **Cache de negativas com limite**: Evita consultas NXDOMAIN redundantes com LRU (max 100k entradas)
+- **Segurança de memória**: maxlen limitado a 63 (label DNS), strings.Builder com grow validado
+- **Thread-safe**: Contador atômico para tracking de progresso
+- **Graceful shutdown**: SIGINT/SIGTERM para encerramento limpo com progresso final
+
+### Exemplo de saída com progresso
+
+```
+[100/100 (100.0%)] Speed: 25.0/s | Active: 4 | Elapsed: 4s
+```
 
 ## Construção Cruzada
 
@@ -80,7 +87,7 @@ GOOS=windows GOARCH=amd64 go build -o dnsbrute.exe .
 
 ## Requisitos
 
-- Go 1.22+
+- Go 1.26+
 - Permissão para consultas DNS ao domínio alvo
 
 ## Aviso

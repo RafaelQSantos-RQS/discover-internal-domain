@@ -18,11 +18,11 @@ A ferramenta SHALL armazenar em cache subdomínios que não resolveram (NXDOMAIN
 - **THEN** a consulta DNS é realizada novamente
 
 ### Requirement: Limite de entradas
-O cache SHALL limitar o número de entradas a 100.000, evictando as entradas mais antigas (LRU) quando o limite é atingido.
+O cache SHALL limitar o número de entradas a 100.000, evictando as entradas mais antigas em ordem de inserção (FIFO) quando o limite é atingido.
 
 #### Scenario: Limite atingido
 - **WHEN** o cache atinge 100.000 entradas e uma nova entrada é adicionada
-- **THEN** a entrada mais antiga é removida para acomodar a nova
+- **THEN** a entrada adicionada primeiro é removida para acomodar a nova
 
 ### Requirement: TTL configurável
 A ferramenta SHALL permitir configurar o TTL do cache via opção de linha de comando; TTL igual a zero SHALL desabilitar o cache.

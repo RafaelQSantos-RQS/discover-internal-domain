@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use dnsengine::{DnsEngine, ResolverPool};
+use generator::{Generator, JobSource, WordlistGenerator};
 
 /// Number of lookup attempts per query before giving up.
 const ATTEMPTS: usize = 2;
@@ -34,9 +35,15 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Load checkpoint (resume position + wildcard IPs).
+    // Load checkpoint (resume position + wildcard IPs). Wordlist mode uses
+    // max_len 0 in the checkpoint (no length dimension).
+    let expected_max_len = if args.wordlist.is_some() {
+        0
+    } else {
+        args.maxlen
+    };
     let checkpoint_data = match &args.checkpoint {
-        Some(path) => match checkpoint::load(Path::new(path), &args.domain, args.maxlen) {
+        Some(path) => match checkpoint::load(Path::new(path), &args.domain, expected_max_len) {
             Ok(cp) => {
                 eprintln!(
                     "Resuming from checkpoint: {} combinations completed",
@@ -92,16 +99,41 @@ async fn main() {
         eprintln!("Wildcard filtering enabled");
     }
 
-    // Generator, resuming from the checkpoint position.
-    let gen = Arc::new(Mutex::new(match &checkpoint_data {
-        Some(cp) => generator::Generator::resume(
-            args.maxlen,
-            args.max_combinations,
-            cp.last_index.clone(),
-            cp.length,
-            cp.completed,
-        ),
-        None => generator::Generator::new(args.maxlen, args.max_combinations),
+    // Job source: exhaustive brute-force or wordlist, resuming from the
+    // checkpoint position.
+    let job_source = match &checkpoint_data {
+        Some(cp) => match &args.wordlist {
+            Some(path) => WordlistGenerator::resume(
+                path,
+                args.max_combinations,
+                cp.last_index.first().copied().unwrap_or(0),
+                cp.completed,
+            )
+            .map(JobSource::Wordlist),
+            None => Ok(JobSource::Brute(Generator::resume(
+                args.maxlen,
+                args.max_combinations,
+                cp.last_index.clone(),
+                cp.length,
+                cp.completed,
+            ))),
+        },
+        None => match &args.wordlist {
+            Some(path) => {
+                WordlistGenerator::new(path, args.max_combinations).map(JobSource::Wordlist)
+            }
+            None => Ok(JobSource::Brute(Generator::new(
+                args.maxlen,
+                args.max_combinations,
+            ))),
+        },
+    };
+    let gen = Arc::new(Mutex::new(match job_source {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }));
 
     // Output writer: file if --out, otherwise stdout. Owned by the writer task.
@@ -171,7 +203,11 @@ async fn main() {
             let path = path.clone();
             let gen = gen.clone();
             let domain = args.domain.clone();
-            let max_len = args.maxlen;
+            let max_len = if args.wordlist.is_some() {
+                0
+            } else {
+                args.maxlen
+            };
             let wips = wildcard_ips.clone();
             let mut cancel_rx = cancel_rx.clone();
             Some(tokio::spawn(async move {
@@ -264,6 +300,42 @@ async fn main() {
     // Worker tasks: consume jobs, perform raw UDP lookups, respect the
     // adaptive worker target, and stream results to the writer task.
     let start = Instant::now();
+
+    // Live progress: rewrite a single stderr line every second.
+    let total_jobs = gen.lock().unwrap().total();
+    let progress = {
+        let completed_counter = completed_counter.clone();
+        let found_counter = found_counter.clone();
+        let mut cancel_rx = cancel_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let elapsed = start.elapsed();
+                        let checked = completed_counter.load(Ordering::Relaxed);
+                        let found = found_counter.load(Ordering::Relaxed);
+                        let qps = if elapsed.as_secs_f64() > 0.0 {
+                            checked as f64 / elapsed.as_secs_f64()
+                        } else {
+                            0.0
+                        };
+                        let pct = if total_jobs > 0 {
+                            checked as f64 / total_jobs as f64 * 100.0
+                        } else {
+                            0.0
+                        };
+                        eprint!(
+                            "\r[{:?}] {checked}/{total_jobs} ({pct:.0}%) {qps:.0} qps | found: {found}",
+                            elapsed
+                        );
+                    }
+                    _ = cancel_rx.changed() => break,
+                }
+            }
+        })
+    };
     let mut workers = Vec::new();
     for _ in 0..args.workers {
         let rx = rx.clone();
@@ -326,8 +398,10 @@ async fn main() {
     if let Some(task) = checkpoint_task {
         let _ = task.await;
     }
+    let _ = progress.await;
     let _ = controller.await;
     let _ = cleanup_task.await;
+    eprintln!(); // break the live progress line
 
     // Summary.
     let elapsed = start.elapsed();
@@ -364,7 +438,7 @@ fn update_ema(ema: &AtomicU64, sample_us: u64) {
 /// Saves a checkpoint snapshot from the current generator state.
 fn save_checkpoint(
     path: &str,
-    gen: &Mutex<generator::Generator>,
+    gen: &Mutex<JobSource>,
     domain: &str,
     max_len: usize,
     wildcard_ips: &[String],

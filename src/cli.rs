@@ -56,6 +56,10 @@ pub struct Args {
     /// File with custom DNS resolvers (one IP or IP:port per line)
     #[arg(short = 'r', long)]
     pub resolvers: Option<String>,
+
+    /// Wordlist file with subdomain names (one per line); overrides brute-force generation
+    #[arg(short = 'f', long)]
+    pub wordlist: Option<String>,
 }
 
 /// Parses durations like `2s`, `5m`, `1h` (seconds/minutes/hours).
@@ -98,6 +102,9 @@ impl Args {
         if let Some(path) = &self.resolvers {
             crate::dnsengine::load_resolvers_file(path)?;
         }
+        if let Some(path) = &self.wordlist {
+            crate::generator::WordlistGenerator::new(path, 0)?;
+        }
         Ok(())
     }
 }
@@ -135,6 +142,8 @@ mod tests {
             "10m",
             "-r",
             "resolvers.txt",
+            "-f",
+            "words.txt",
         ]);
         assert_eq!(a.domain, "example.com");
         assert_eq!(a.maxlen, 3);
@@ -147,6 +156,7 @@ mod tests {
         assert_eq!(a.checkpoint.as_deref(), Some("cp.json"));
         assert_eq!(a.cache_ttl, Duration::from_secs(600));
         assert_eq!(a.resolvers.as_deref(), Some("resolvers.txt"));
+        assert_eq!(a.wordlist.as_deref(), Some("words.txt"));
     }
 
     #[test]
@@ -189,6 +199,12 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_resolvers_file() {
         let mut a = parse(&["dnsbrute", "-d", "example.com", "-r", "/nonexistent.txt"]);
+        assert!(a.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_wordlist() {
+        let mut a = parse(&["dnsbrute", "-d", "example.com", "-f", "/nonexistent.txt"]);
         assert!(a.validate().is_err());
     }
 }

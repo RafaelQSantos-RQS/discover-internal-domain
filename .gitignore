@@ -7,6 +7,9 @@ discover-internal-domain
 *.so
 *.dylib
 
+# Rust
+/target
+
 # Test binary, built with `go test -c`
 *.test
 

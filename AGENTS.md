@@ -2,124 +2,123 @@
 
 ## Project Overview
 - **Repository:** `discover-internal-domain`
-- **Language:** Go 1.26.1
+- **Language:** Rust (edition 2021)
 - **Purpose:** Brute-force DNS enumeration for internal assets (wildcard detection, worker pools, checkpointing)
-- **Entry point:** `main.go` (root package)
+- **Entry point:** `src/main.rs` (binary `dnsbrute`)
 
 ---
 
 ## Build & Run Commands
 
 ```bash
-# Build
-go build ./...
+# Build (debug)
+cargo build
+
+# Build (release)
+cargo build --release
 
 # Run
-go run . -domain=example.com -maxlen=4 -workers=20
+cargo run -- -d example.com -m 4 -w 20
 
-# Cross-compile
-GOOS=linux GOARCH=amd64 go build -o dnsbrute .
+# Run the compiled binary
+./target/release/dnsbrute -d example.com -m 4 -w 20
 
 # Clean
-go clean -cache -testcache
+cargo clean
 ```
 
 ## Testing
 
 ```bash
-# All tests (no cache, shuffled)
-go test ./... -count=1 -shuffle=on -v
+# All tests
+cargo test
 
 # Single test by name
-go test ./... -run ^TestFunctionName$ -v
+cargo test <test_name>
 
-# Coverage report
-go test ./... -coverprofile=coverage.out
-go tool cover -html=coverage.out -o coverage.html
-
-# Benchmarks
-go test -bench=. -benchmem ./...
+# Tests with output
+cargo test -- --nocapture
 ```
 
 ## Linting & Formatting
 
 ```bash
 # Format (required before commit)
-gofmt -s -w .
+cargo fmt
 
-# Preferred: also fixes imports
-go run golang.org/x/tools/cmd/goimports -w .
+# Check formatting (CI)
+cargo fmt --check
 
-# Lint
-golangci-lint run --out-format=colored-line-number
-go vet ./...
+# Lint (CI: deny warnings)
+cargo clippy
+cargo clippy -- -D warnings
 ```
 
 ## Code Style
 
-### Import Organization (3 blocks, blank line between)
-```go
-import (
-    "context"
-    "fmt"
-    "net"
-
-    "github.com/spf13/pflag"
-)
+### Module Structure
+```
+src/
+  main.rs        # entry, pipeline (produtor → canal → workers), signals, resumo
+  cli.rs         # clap args + validação
+  generator.rs   # gerador iterativo de combinações (com retomada)
+  resolver.rs    # lookup DNS + detecção/filtragem de wildcard
+  negcache.rs    # cache negativo (HashMap + VecDeque)
+  checkpoint.rs  # save/load atômico + validação
 ```
 
 ### Naming Conventions
 | Element | Convention |
 |---------|------------|
-| Packages | lowercase, no underscores (`resolver`) |
-| Exported | PascalCase (`GenerateCombinations`) |
-| Local variables | camelCase (`maxLen`) |
-| Constants | PascalCase (`DefaultTimeout`) |
-| File names | snake_case (`resolver.go`) |
-| Initialisms | uppercase (`DNS`, `IP`, `JSON`) |
+| Crates/types | `snake_case` (`TokioResolver`) |
+| Functions | `snake_case` (`lookup_ip`) |
+| Local variables | `snake_case` (`max_len`) |
+| Constants | `SCREAMING_SNAKE_CASE` (`MAX_MAX_LEN`) |
+| File names | `snake_case` (`negcache.rs`) |
+| Modules | lowercase, no underscores (`negcache`) |
 
 ### Error Handling
-- Wrap errors: `return fmt.Errorf("lookup %s: %w", host, err)`
-- Log non-fatal errors: `log.Printf("error: %v", err)`
-- Use `errors.Is` / `errors.As` for inspection
-- Exported errors: `var ErrNotFound = errors.New("not found")`
+- Return `Result<T, String>` with clear messages: `format!("read checkpoint: {e}")`
+- Use `Option` for non-error absence (`Option<Vec<String>>`)
+- Prefer `?` for propagation; handle fatal errors in `main` with `eprintln!` + `process::exit(1)`
+- Non-fatal errors: `eprintln!("Warning: ...")`
 
 ### Types & Structs
 - Keep structs small, single responsibility
-- Export fields only when necessary
-- Use `context.Context` as first argument for I/O
-- Configuration via `pflag` with struct tags
+- Use `pub` only when needed; tests use `#[cfg(test)] mod tests` in-file
+- Async I/O functions are `async fn`; `Arc`/`Mutex` for shared state
 
-```go
-type Config struct {
-    Domain  string        `flag:"domain" description:"Base domain"`
-    MaxLen  int           `flag:"maxlen" description:"Max length"`
-    Timeout time.Duration `flag:"timeout" description:"Query timeout"`
+```rust
+pub struct NegCache {
+    inner: Mutex<Inner>,
+    ttl: Duration,
 }
 ```
 
 ## Concurrency Patterns
-- Worker pools with bounded channels
-- `sync.WaitGroup` for graceful shutdown
-- Context deadlines on all I/O operations
-- `net.Resolver{PreferGo: true}` for DNS queries
+- `tokio::spawn` worker pool consuming a bounded `async_channel`
+- `Arc` + `Mutex` for shared mutable state (generator, output writer)
+- `Arc<AtomicU64>` for counters
+- `tokio::sync::watch` for cancellation signals
+- Per-query DNS timeout via `tokio::time::timeout` + `ResolverOpts.timeout`
+- `hickory_resolver::TokioResolver` for DNS queries (clone into workers)
 - Avoid global mutable state
 
 ## Security Guidelines
 - Do NOT log IPs/hostnames at INFO level
 - Validate all input flags (non-negative, reasonable bounds)
 - Use `--max-combinations` to prevent resource exhaustion
-- Write checkpoints atomically (temp + rename)
+- Write checkpoints atomically (temp + rename + sync)
 - Set checkpoint file permissions: `0600`
 
 ## Documentation
-- Every exported function/type needs godoc comment
+- Every `pub` item needs a `///` doc comment
 - Complex algorithms need complexity analysis
-- Line length: ≤100 characters
+- Line length: ≤100 characters (enforced by `cargo fmt`/`rustfmt`)
 
 ---
 
 ## Cursor & Copilot Rules
 None present. Reference this file if added later.
 
-*Last updated: 2026-03-19*
+*Last updated: 2026-08-18*

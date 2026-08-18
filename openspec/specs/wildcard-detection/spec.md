@@ -6,16 +6,20 @@ Detecção de respostas DNS wildcard (domínio curinga) via probe de subdomínio
 
 ## Requirements
 
-### Requirement: Detecção de wildcard
-A ferramenta SHALL detectar wildcards consultando um subdomínio aleatório do domínio alvo; se o subdomínio aleatório resolver, os IPs retornados SHALL ser considerados o padrão wildcard.
+### Requirement: Detecção de wildcard com múltiplos probes
+A ferramenta SHALL detectar wildcards consultando N subdomínios aleatórios do domínio alvo (default 3); os IPs retornados pelos probes que resolvem SHALL ser unificados como o padrão wildcard.
 
 #### Scenario: Wildcard presente
-- **WHEN** um subdomínio aleatório do domínio alvo resolve para endereços IP
-- **THEN** esses IPs são registrados como padrão wildcard
+- **WHEN** um ou mais subdomínios aleatórios do domínio alvo resolvem para endereços IP
+- **THEN** a união dos IPs retornados é registrada como padrão wildcard
 
 #### Scenario: Sem wildcard
-- **WHEN** um subdomínio aleatório do domínio alvo não resolve
+- **WHEN** nenhum subdomínio aleatório do domínio alvo resolve
 - **THEN** nenhum padrão wildcard é registrado
+
+#### Scenario: Wildcard parcial
+- **WHEN** apenas alguns dos N probes resolvem
+- **THEN** os IPs dos probes que resolveram são registrados como padrão wildcard
 
 ### Requirement: Filtragem de respostas wildcard
 A ferramenta SHALL descartar resultados de subdomínios cujos IPs correspondam integralmente ao padrão wildcard detectado.

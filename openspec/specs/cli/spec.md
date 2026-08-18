@@ -7,7 +7,7 @@ Interface de linha de comando da ferramenta de enumeração DNS por brute-force,
 ## Requirements
 
 ### Requirement: Opções de linha de comando
-A ferramenta SHALL aceitar as seguintes opções via linha de comando: domínio base (obrigatório), comprimento máximo de subdomínio, número de workers, timeout por consulta DNS, habilitação de detecção de wildcard, arquivo de saída, limite máximo de combinações, tamanho do buffer de jobs, arquivo de checkpoint e TTL do cache negativo.
+A ferramenta SHALL aceitar as seguintes opções via linha de comando: domínio base (obrigatório), comprimento máximo de subdomínio, número de workers, timeout por consulta DNS, habilitação de detecção de wildcard, arquivo de saída, limite máximo de combinações, tamanho do buffer de jobs, arquivo de checkpoint, TTL do cache negativo e arquivo de resolvers customizados.
 
 #### Scenario: Execução com opções válidas
 - **WHEN** o usuário executa a ferramenta com domínio e opções válidas
@@ -18,7 +18,7 @@ A ferramenta SHALL aceitar as seguintes opções via linha de comando: domínio 
 - **THEN** a ferramenta exibe erro e encerra com código de saída não-zero
 
 ### Requirement: Validação de opções
-A ferramenta SHALL validar as opções antes de iniciar a enumeração: comprimento máximo entre 1 e 63 (limite de label DNS), número de workers maior ou igual a 1, buffer maior ou igual a 1 e TTL de cache não-negativo. Valores inválidos SHALL resultar em erro com mensagem clara e código de saída não-zero.
+A ferramenta SHALL validar as opções antes de iniciar a enumeração: comprimento máximo entre 1 e 63 (limite de label DNS), número de workers maior ou igual a 1, buffer maior ou igual a 1, TTL de cache não-negativo e arquivo de resolvers legível com pelo menos um resolver válido. Valores inválidos SHALL resultar em erro com mensagem clara e código de saída não-zero.
 
 #### Scenario: Comprimento máximo acima do limite
 - **WHEN** o usuário informa comprimento máximo maior que 63
@@ -28,12 +28,20 @@ A ferramenta SHALL validar as opções antes de iniciar a enumeração: comprime
 - **WHEN** o usuário informa workers menor que 1
 - **THEN** a ferramenta exibe erro e encerra com código de saída não-zero
 
+#### Scenario: Arquivo de resolvers inválido
+- **WHEN** o usuário informa um arquivo de resolvers inexistente, ilegível ou sem resolvers válidos
+- **THEN** a ferramenta exibe erro e encerra com código de saída não-zero
+
 ### Requirement: Saída de resultados
-A ferramenta SHALL exibir cada subdomínio descoberto no formato `fqdn -> ip1,ip2` (IPs separados por vírgula) em stdout, e SHALL exibir um resumo final (total verificado, total encontrado, tempo decorrido) em stderr.
+A ferramenta SHALL exibir cada subdomínio descoberto no formato `fqdn -> ip1,ip2` (IPs separados por vírgula) em stdout, e SHALL exibir um resumo final (total verificado, total encontrado, tempo decorrido) em stderr. Quando o resultado incluir um alvo CNAME, o formato SHALL ser `fqdn -> cname -> ip1,ip2`.
 
 #### Scenario: Subdomínio descoberto
 - **WHEN** um subdomínio resolve para um ou mais endereços IP
 - **THEN** a ferramenta imprime `fqdn -> ip1,ip2` em stdout
+
+#### Scenario: Subdomínio descoberto via CNAME
+- **WHEN** um subdomínio resolve via CNAME para endereços IP
+- **THEN** a ferramenta imprime `fqdn -> cname -> ip1,ip2` em stdout
 
 #### Scenario: Fim da enumeração
 - **WHEN** a enumeração termina normalmente

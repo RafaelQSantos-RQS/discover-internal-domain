@@ -47,3 +47,6 @@ checkpoint-*.tmp
 
 # Logs
 *.log
+
+# Temp
+.tmp/

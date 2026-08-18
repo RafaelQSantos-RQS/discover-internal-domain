@@ -1,16 +1,29 @@
 mod checkpoint;
 mod cli;
+mod dnsengine;
 mod generator;
 mod negcache;
 mod resolver;
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+
+use dnsengine::{DnsEngine, ResolverPool};
+
+/// Number of lookup attempts per query before giving up.
+const ATTEMPTS: usize = 2;
+
+/// EMA smoothing factor for the adaptive worker latency.
+const EMA_ALPHA: f64 = 0.2;
+
+/// Latency thresholds (microseconds) for the adaptive worker controller.
+const LATENCY_FAST_US: u64 = 50_000;
+const LATENCY_SLOW_US: u64 = 200_000;
 
 #[tokio::main]
 async fn main() {
@@ -39,16 +52,24 @@ async fn main() {
         None => None,
     };
 
-    // Build the DNS resolver.
-    let resolver = match resolver::build_resolver(args.timeout) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
+    // Build the raw UDP DNS engine with the resolver pool.
+    let pool = match &args.resolvers {
+        Some(path) => match dnsengine::load_resolvers_file(path) {
+            Ok(r) => ResolverPool::new(r),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => ResolverPool::new(dnsengine::load_system_resolvers()),
     };
+    if pool.is_empty() {
+        eprintln!("Error: no DNS resolvers available (use -r to provide a list)");
+        std::process::exit(1);
+    }
+    let engine = DnsEngine::new(pool, args.timeout, ATTEMPTS);
 
-    // Wildcard detection: restore from checkpoint or probe a random subdomain.
+    // Wildcard detection: restore from checkpoint or probe N random subdomains.
     let mut wildcard_ips: Vec<String> = Vec::new();
     if args.wildcard {
         if let Some(cp) = &checkpoint_data {
@@ -58,7 +79,7 @@ async fn main() {
             }
         }
         if wildcard_ips.is_empty() {
-            wildcard_ips = resolver::detect_wildcards(&resolver, &args.domain, args.timeout).await;
+            wildcard_ips = resolver::detect_wildcards(&engine, &args.domain).await;
             if wildcard_ips.is_empty() {
                 eprintln!("No wildcard detected");
             } else {
@@ -83,27 +104,43 @@ async fn main() {
         None => generator::Generator::new(args.maxlen, args.max_combinations),
     }));
 
-    // Output writer: file if --out, otherwise stdout.
-    let writer: Arc<Mutex<Box<dyn Write + Send>>> = match &args.out {
+    // Output writer: file if --out, otherwise stdout. Owned by the writer task.
+    let writer: Box<dyn Write + Send> = match &args.out {
         Some(path) => match std::fs::File::create(path) {
-            Ok(f) => Arc::new(Mutex::new(Box::new(f))),
+            Ok(f) => Box::new(f),
             Err(e) => {
                 eprintln!("Error: cannot open output file {path}: {e}");
                 std::process::exit(1);
             }
         },
-        None => Arc::new(Mutex::new(Box::new(std::io::stdout()))),
+        None => Box::new(std::io::stdout()),
     };
 
-    // Bounded job channel (producer -> workers).
+    // Bounded job channel (producer -> workers) and unbounded result channel
+    // (workers -> writer task).
     let (tx, rx) = async_channel::bounded(args.buffer);
     let rx = Arc::new(rx);
+    let (result_tx, result_rx) = async_channel::unbounded::<String>();
+
+    // Writer task: owns the output, drains result lines from the channel.
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Ok(line) = result_rx.recv().await {
+            let _ = writer.write_all(line.as_bytes());
+        }
+        let _ = writer.flush();
+    });
 
     // Shared counters and negative cache.
     let initial_completed = checkpoint_data.as_ref().map(|cp| cp.completed).unwrap_or(0);
     let completed_counter = Arc::new(AtomicU64::new(initial_completed));
     let found_counter = Arc::new(AtomicU64::new(0));
     let neg_cache = Arc::new(negcache::NegCache::new(args.cache_ttl));
+
+    // Adaptive worker state.
+    let target_workers = Arc::new(AtomicUsize::new(args.workers));
+    let active_workers = Arc::new(AtomicUsize::new(0));
+    let latency_ema = Arc::new(AtomicU64::new(0));
 
     // Cancellation signal (Ctrl+C / SIGTERM / normal completion).
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -170,6 +207,35 @@ async fn main() {
         })
     };
 
+    // Adaptive worker controller: adjusts the target worker count from the
+    // EMA of query latency (fast -> ramp up, slow -> ramp down).
+    let controller = {
+        let target_workers = target_workers.clone();
+        let latency_ema = latency_ema.clone();
+        let max_workers = args.workers;
+        let mut cancel_rx = cancel_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let ema_us = latency_ema.load(Ordering::Relaxed);
+                        let target = if ema_us == 0 || ema_us < LATENCY_FAST_US {
+                            max_workers
+                        } else if ema_us > LATENCY_SLOW_US {
+                            let cur = target_workers.load(Ordering::Relaxed);
+                            (cur * 3 / 4).max(1)
+                        } else {
+                            target_workers.load(Ordering::Relaxed)
+                        };
+                        target_workers.store(target, Ordering::Relaxed);
+                    }
+                    _ = cancel_rx.changed() => break,
+                }
+            }
+        })
+    };
+
     // Producer task: generate combinations into the channel.
     let producer = {
         let gen = gen.clone();
@@ -195,38 +261,54 @@ async fn main() {
         })
     };
 
-    // Worker tasks: consume jobs and perform DNS lookups.
+    // Worker tasks: consume jobs, perform raw UDP lookups, respect the
+    // adaptive worker target, and stream results to the writer task.
     let start = Instant::now();
     let mut workers = Vec::new();
     for _ in 0..args.workers {
         let rx = rx.clone();
-        let resolver = resolver.clone();
+        let engine = engine.clone();
         let wildcard = wildcard.clone();
         let neg_cache = neg_cache.clone();
-        let writer = writer.clone();
+        let result_tx = result_tx.clone();
         let domain = args.domain.clone();
-        let timeout = args.timeout;
         let found_counter = found_counter.clone();
+        let target_workers = target_workers.clone();
+        let active_workers = active_workers.clone();
+        let latency_ema = latency_ema.clone();
         workers.push(tokio::spawn(async move {
-            while let Ok(comb) = rx.recv().await {
-                let fqdn = format!("{comb}.{domain}");
-                if neg_cache.is_cached(&fqdn) {
-                    continue;
+            loop {
+                // Adaptive gate: wait while at/over the target worker count.
+                while active_workers.load(Ordering::Relaxed)
+                    >= target_workers.load(Ordering::Relaxed)
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                match resolver::lookup(&resolver, &fqdn, timeout).await {
-                    Some(ips) => {
-                        if wildcard.is_wildcard_response(&ips) {
-                            continue;
+                let comb = match rx.recv().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                active_workers.fetch_add(1, Ordering::Relaxed);
+                let query_start = Instant::now();
+                let fqdn = format!("{comb}.{domain}");
+                if !neg_cache.is_cached(&fqdn) {
+                    if let Some(res) = resolver::lookup(&engine, &fqdn).await {
+                        if !wildcard.is_wildcard_response(&res.ips) {
+                            found_counter.fetch_add(1, Ordering::Relaxed);
+                            let line = match &res.cname {
+                                Some(cname) => {
+                                    format!("{fqdn} -> {cname} -> {}\n", res.ips.join(", "))
+                                }
+                                None => format!("{fqdn} -> {}\n", res.ips.join(", ")),
+                            };
+                            let _ = result_tx.send(line).await;
                         }
-                        found_counter.fetch_add(1, Ordering::Relaxed);
-                        let line = format!("{fqdn} -> {}\n", ips.join(", "));
-                        let mut w = writer.lock().unwrap();
-                        let _ = w.write_all(line.as_bytes());
-                    }
-                    None => {
+                    } else {
                         neg_cache.add(fqdn);
                     }
                 }
+                update_ema(&latency_ema, query_start.elapsed().as_micros() as u64);
+                active_workers.fetch_sub(1, Ordering::Relaxed);
             }
         }));
     }
@@ -235,30 +317,48 @@ async fn main() {
     let _ = producer.await;
     let _ = cancel_tx.send(true);
 
-    // Wait for workers to drain and the checkpoint saver to finish.
+    // Wait for workers to drain, the writer to flush, and background tasks.
     for w in workers {
         let _ = w.await;
     }
+    drop(result_tx);
+    let _ = writer_task.await;
     if let Some(task) = checkpoint_task {
         let _ = task.await;
     }
+    let _ = controller.await;
     let _ = cleanup_task.await;
 
     // Summary.
     let elapsed = start.elapsed();
+    let checked = completed_counter.load(Ordering::Relaxed);
+    let qps = if elapsed.as_secs_f64() > 0.0 {
+        checked as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
     eprintln!("\n========================================");
     eprintln!("  DNS Enumeration Complete");
     eprintln!("========================================");
-    eprintln!(
-        "  Total checked:  {}",
-        completed_counter.load(Ordering::Relaxed)
-    );
+    eprintln!("  Total checked:  {}", checked);
     eprintln!(
         "  Found:          {}",
         found_counter.load(Ordering::Relaxed)
     );
     eprintln!("  Time:           {:?}", elapsed);
+    eprintln!("  Rate:           {:.0} qps", qps);
     eprintln!("========================================");
+}
+
+/// Updates the exponential moving average of query latency (in microseconds).
+fn update_ema(ema: &AtomicU64, sample_us: u64) {
+    let current = ema.load(Ordering::Relaxed) as f64;
+    let new = if current == 0.0 {
+        sample_us as f64
+    } else {
+        EMA_ALPHA * sample_us as f64 + (1.0 - EMA_ALPHA) * current
+    };
+    ema.store(new as u64, Ordering::Relaxed);
 }
 
 /// Saves a checkpoint snapshot from the current generator state.

@@ -52,6 +52,10 @@ pub struct Args {
     /// Negative DNS cache TTL (0 = disabled)
     #[arg(short = 'l', long, default_value = "5m", value_parser = parse_duration)]
     pub cache_ttl: Duration,
+
+    /// File with custom DNS resolvers (one IP or IP:port per line)
+    #[arg(short = 'r', long)]
+    pub resolvers: Option<String>,
 }
 
 /// Parses durations like `2s`, `5m`, `1h` (seconds/minutes/hours).
@@ -91,6 +95,9 @@ impl Args {
         if self.buffer < 1 {
             return Err("--buffer must be >= 1".into());
         }
+        if let Some(path) = &self.resolvers {
+            crate::dnsengine::load_resolvers_file(path)?;
+        }
         Ok(())
     }
 }
@@ -126,6 +133,8 @@ mod tests {
             "cp.json",
             "-l",
             "10m",
+            "-r",
+            "resolvers.txt",
         ]);
         assert_eq!(a.domain, "example.com");
         assert_eq!(a.maxlen, 3);
@@ -137,6 +146,7 @@ mod tests {
         assert_eq!(a.buffer, 50);
         assert_eq!(a.checkpoint.as_deref(), Some("cp.json"));
         assert_eq!(a.cache_ttl, Duration::from_secs(600));
+        assert_eq!(a.resolvers.as_deref(), Some("resolvers.txt"));
     }
 
     #[test]
@@ -174,5 +184,11 @@ mod tests {
         let mut a = parse(&["dnsbrute", "-d", "example.com", "-m", "100"]);
         a.validate().unwrap();
         assert_eq!(a.maxlen, 63);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_resolvers_file() {
+        let mut a = parse(&["dnsbrute", "-d", "example.com", "-r", "/nonexistent.txt"]);
+        assert!(a.validate().is_err());
     }
 }

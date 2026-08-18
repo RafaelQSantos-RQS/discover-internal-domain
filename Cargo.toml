@@ -5,9 +5,9 @@ edition = "2021"
 description = "DNS brute-force enumeration tool for discovering internal assets"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 clap = { version = "4", features = ["derive"] }
-hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
+hickory-proto = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-channel = "2"

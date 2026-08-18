@@ -124,6 +124,7 @@ async fn main() {
             }
             None => Ok(JobSource::Brute(Generator::new(
                 args.maxlen,
+                args.min_len,
                 args.max_combinations,
             ))),
         },
@@ -168,6 +169,21 @@ async fn main() {
     let completed_counter = Arc::new(AtomicU64::new(initial_completed));
     let found_counter = Arc::new(AtomicU64::new(0));
     let neg_cache = Arc::new(negcache::NegCache::new(args.cache_ttl));
+
+    // --include-root: resolve and report the root domain itself (not subject
+    // to wildcard filtering; it is the explicit target).
+    if args.include_root {
+        if let Some(res) = resolver::lookup(&engine, &args.domain).await {
+            found_counter.fetch_add(1, Ordering::Relaxed);
+            let line = match &res.cname {
+                Some(cname) => {
+                    format!("{} -> {cname} -> {}\n", args.domain, res.ips.join(", "))
+                }
+                None => format!("{} -> {}\n", args.domain, res.ips.join(", ")),
+            };
+            let _ = result_tx.send(line).await;
+        }
+    }
 
     // Adaptive worker state.
     let target_workers = Arc::new(AtomicUsize::new(args.workers));

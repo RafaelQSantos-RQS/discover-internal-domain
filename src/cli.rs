@@ -14,6 +14,14 @@ pub struct Args {
     #[arg(short, long, default_value_t = 5)]
     pub maxlen: usize,
 
+    /// Minimum length of subdomain combinations (skip shorter ranges)
+    #[arg(long, default_value_t = 1)]
+    pub min_len: usize,
+
+    /// Also resolve and report the root domain itself
+    #[arg(long)]
+    pub include_root: bool,
+
     /// Number of concurrent workers
     #[arg(short, long, default_value_t = default_workers())]
     pub workers: usize,
@@ -93,6 +101,12 @@ impl Args {
         if self.maxlen > 63 {
             self.maxlen = 63;
         }
+        if self.min_len < 1 {
+            return Err("--min-len must be >= 1".into());
+        }
+        if self.min_len > self.maxlen {
+            return Err(format!("--min-len must be <= --maxlen ({})", self.maxlen));
+        }
         if self.workers < 1 {
             return Err("--workers must be >= 1".into());
         }
@@ -144,9 +158,14 @@ mod tests {
             "resolvers.txt",
             "-f",
             "words.txt",
+            "--min-len",
+            "2",
+            "--include-root",
         ]);
         assert_eq!(a.domain, "example.com");
         assert_eq!(a.maxlen, 3);
+        assert_eq!(a.min_len, 2);
+        assert!(a.include_root);
         assert_eq!(a.workers, 10);
         assert_eq!(a.timeout, Duration::from_secs(1));
         assert!(a.wildcard);
@@ -205,6 +224,12 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_wordlist() {
         let mut a = parse(&["dnsbrute", "-d", "example.com", "-f", "/nonexistent.txt"]);
+        assert!(a.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_min_len_above_maxlen() {
+        let mut a = parse(&["dnsbrute", "-d", "example.com", "-m", "2", "--min-len", "3"]);
         assert!(a.validate().is_err());
     }
 }

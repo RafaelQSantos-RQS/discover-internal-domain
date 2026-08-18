@@ -4,22 +4,25 @@ pub const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-";
 /// DNS label maximum length.
 pub const MAX_MAX_LEN: usize = 63;
 
-/// Iteratively produces subdomain combinations of length 1..=max_len.
+/// Iteratively produces subdomain combinations of length min_len..=max_len.
 pub struct Generator {
     indices: Vec<usize>,
     length: usize,
+    min_len: usize,
     max_len: usize,
     max_combs: Option<u64>,
     produced: u64,
 }
 
 impl Generator {
-    /// Creates a generator starting from the first combination.
-    pub fn new(max_len: usize, max_combs: u64) -> Self {
+    /// Creates a generator starting from the first combination of `min_len`.
+    pub fn new(max_len: usize, min_len: usize, max_combs: u64) -> Self {
         let max_len = max_len.min(MAX_MAX_LEN);
+        let min_len = min_len.clamp(1, max_len);
         Self {
             indices: vec![0; max_len],
-            length: 1,
+            length: min_len,
+            min_len,
             max_len,
             max_combs: (max_combs > 0).then_some(max_combs),
             produced: 0,
@@ -44,6 +47,7 @@ impl Generator {
         Self {
             indices,
             length,
+            min_len: 1,
             max_len,
             max_combs: (max_combs > 0).then_some(max_combs),
             produced: completed,
@@ -90,10 +94,10 @@ impl Generator {
         (self.indices.clone(), self.length, self.produced)
     }
 
-    /// Total number of combinations in the full space (1..=max_len).
+    /// Total number of combinations in the full space (min_len..=max_len).
     pub fn total(&self) -> u64 {
         let mut total = 0u64;
-        for len in 1..=self.max_len {
+        for len in self.min_len..=self.max_len {
             total += (ALPHABET.len() as u64).pow(len as u32);
         }
         total
@@ -208,7 +212,7 @@ mod tests {
 
     #[test]
     fn generates_all_single_char_combinations() {
-        let mut g = Generator::new(1, 0);
+        let mut g = Generator::new(1, 1, 0);
         let mut count = 0;
         while let Some(c) = g.next() {
             assert_eq!(c.len(), 1);
@@ -220,7 +224,7 @@ mod tests {
 
     #[test]
     fn progresses_to_next_length() {
-        let mut g = Generator::new(2, 0);
+        let mut g = Generator::new(2, 1, 0);
         let mut count = 0;
         let mut saw_two = false;
         while let Some(c) = g.next() {
@@ -234,14 +238,26 @@ mod tests {
     }
 
     #[test]
+    fn min_len_starts_at_given_length() {
+        let mut g = Generator::new(3, 2, 0);
+        assert_eq!(g.total(), 37 * 37 + 37 * 37 * 37);
+        let mut count = 0;
+        while let Some(c) = g.next() {
+            assert!(c.len() >= 2);
+            count += 1;
+        }
+        assert_eq!(count, 37 * 37 + 37 * 37 * 37);
+    }
+
+    #[test]
     fn caps_max_len_at_63() {
-        let g = Generator::new(100, 0);
+        let g = Generator::new(100, 1, 0);
         assert_eq!(g.max_len, 63);
     }
 
     #[test]
     fn respects_max_combs() {
-        let mut g = Generator::new(3, 5);
+        let mut g = Generator::new(3, 1, 5);
         let mut count = 0;
         while g.next().is_some() {
             count += 1;
@@ -251,7 +267,7 @@ mod tests {
 
     #[test]
     fn resumes_without_repetition() {
-        let mut g = Generator::new(2, 0);
+        let mut g = Generator::new(2, 1, 0);
         let mut first: Vec<String> = Vec::new();
         for _ in 0..50 {
             first.push(g.next().unwrap());
@@ -284,7 +300,7 @@ mod tests {
 
     #[test]
     fn total_counts_full_space() {
-        let g = Generator::new(2, 0);
+        let g = Generator::new(2, 1, 0);
         assert_eq!(g.total(), 37 + 37 * 37);
     }
 
